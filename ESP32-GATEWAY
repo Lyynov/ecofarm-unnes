@@ -1,6 +1,6 @@
 /*
- * EcoFarm IoT - ESP32 Gateway
- * Fungsi: Menerima data dari ESP32 Sensor Node, kirim ke Web Server
+ * EcoFarm IoT - ESP32 Gateway (Complete IoT Dashboard)
+ * Fungsi: Menerima data dari ESP32 Sensor Node, kirim ke Web Server, Dashboard API
  */
 
 #include <WiFi.h>
@@ -32,15 +32,31 @@ struct SensorData {
   unsigned long freeHeap;
   String chipId;
   unsigned long receivedAt;
+  unsigned long gatewayStartTime;
 };
 
 SensorData lastSensorData;
 bool dataReceived = false;
 unsigned long lastWebSend = 0;
+unsigned long gatewayStartTime = 0;
 const unsigned long WEB_SEND_INTERVAL = 10000; // Send to web every 10 seconds
+
+// Data history untuk chart (simplified)
+struct HistoryData {
+  float temperature;
+  float humidity;
+  bool relayStatus;
+  unsigned long timestamp;
+};
+
+const int MAX_HISTORY = 50;  // Store last 50 readings
+HistoryData dataHistory[MAX_HISTORY];
+int historyIndex = 0;
+int historyCount = 0;
 
 void setup() {
   Serial.begin(115200);
+  gatewayStartTime = millis();
   
   // Initialize SPIFFS
   if (!SPIFFS.begin(true)) {
@@ -61,8 +77,10 @@ void setup() {
   Serial.println("🚀 ESP32 Gateway Started!");
   Serial.println("📡 Listening for sensor data on port 8080");
   Serial.println("🌐 Web interface: http://" + WiFi.localIP().toString() + ":8080");
-  Serial.println("📊 API endpoint: http://" + WiFi.localIP().toString() + ":8080/sensor-data");
-  Serial.println("📈 Dashboard: http://" + WiFi.localIP().toString() + ":8080/dashboard");
+  Serial.println("📊 API endpoint: http://" + WiFi.localIP().toString() + ":8080/api/data");
+  Serial.println("📈 Dashboard: http://" + WiFi.localIP().toString() + ":8080");
+  Serial.println("🔧 History API: http://" + WiFi.localIP().toString() + ":8080/api/history");
+  Serial.println("⚙️  Status API: http://" + WiFi.localIP().toString() + ":8080/api/status");
 }
 
 void loop() {
@@ -101,7 +119,22 @@ void connectWiFi() {
   Serial.println(" dBm");
 }
 
+void addToHistory(float temp, float hum, bool relay) {
+  dataHistory[historyIndex].temperature = temp;
+  dataHistory[historyIndex].humidity = hum;
+  dataHistory[historyIndex].relayStatus = relay;
+  dataHistory[historyIndex].timestamp = millis();
+  
+  historyIndex = (historyIndex + 1) % MAX_HISTORY;
+  if (historyCount < MAX_HISTORY) {
+    historyCount++;
+  }
+}
+
 void setupWebServer() {
+  // Enable CORS for all routes
+  server.enableCORS(true);
+  
   // CORS headers for all requests
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
@@ -117,15 +150,15 @@ void setupWebServer() {
   // Route untuk menerima data dari sensor node
   server.on("/sensor-data", HTTP_POST, handleSensorData);
   
-  // Route untuk mendapatkan data terbaru (API)
-  server.on("/api/latest", HTTP_GET, handleGetLatestData);
-  
-  // Route untuk dashboard web
+  // Route untuk dashboard web (serve the IoT dashboard)
   server.on("/", HTTP_GET, handleDashboard);
   server.on("/dashboard", HTTP_GET, handleDashboard);
   
-  // Route untuk mendapatkan data dalam format JSON
-  server.on("/api/data", HTTP_GET, handleGetApiData);
+  // API Routes untuk dashboard
+  server.on("/api/data", HTTP_GET, handleGetApiData);           // Current data for dashboard
+  server.on("/api/latest", HTTP_GET, handleGetLatestData);      // Detailed latest data
+  server.on("/api/history", HTTP_GET, handleGetHistory);        // Historical data for charts
+  server.on("/api/status", HTTP_GET, handleGetSystemStatus);    // System status info
 }
 
 void handleSensorData() {
@@ -159,8 +192,12 @@ void handleSensorData() {
     lastSensorData.freeHeap = doc["freeHeap"];
     lastSensorData.chipId = doc["chipId"].as<String>();
     lastSensorData.receivedAt = millis();
+    lastSensorData.gatewayStartTime = gatewayStartTime;
     
     dataReceived = true;
+    
+    // Add to history for charts
+    addToHistory(lastSensorData.temperature, lastSensorData.humidity, lastSensorData.relayStatus);
     
     Serial.println("✅ Data stored successfully!");
     Serial.println("🌡️  Temperature: " + String(lastSensorData.temperature) + "°C");
@@ -173,6 +210,30 @@ void handleSensorData() {
   } else {
     server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"No data received\"}");
   }
+}
+
+void handleGetApiData() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  
+  if (!dataReceived) {
+    server.send(200, "application/json", "{\"temperature\":0,\"humidity\":0,\"relayStatus\":false,\"online\":false,\"wifiSignal\":-100,\"lastUpdate\":999,\"freeHeap\":0}");
+    return;
+  }
+  
+  bool isOnline = (millis() - lastSensorData.receivedAt) < 30000; // Consider online if data < 30 seconds old
+  unsigned long lastUpdateSeconds = (millis() - lastSensorData.receivedAt) / 1000;
+  
+  String json = "{";
+  json += "\"temperature\":" + String(lastSensorData.temperature) + ",";
+  json += "\"humidity\":" + String(lastSensorData.humidity) + ",";
+  json += "\"relayStatus\":" + String(lastSensorData.relayStatus ? "true" : "false") + ",";
+  json += "\"wifiSignal\":" + String(lastSensorData.wifiSignal) + ",";
+  json += "\"online\":" + String(isOnline ? "true" : "false") + ",";
+  json += "\"lastUpdate\":" + String(lastUpdateSeconds) + ",";
+  json += "\"freeHeap\":" + String(lastSensorData.freeHeap);
+  json += "}";
+  
+  server.send(200, "application/json", json);
 }
 
 void handleGetLatestData() {
@@ -197,6 +258,7 @@ void handleGetLatestData() {
   doc["data"]["chipId"] = lastSensorData.chipId;
   doc["data"]["receivedAt"] = lastSensorData.receivedAt;
   doc["data"]["ageSeconds"] = (millis() - lastSensorData.receivedAt) / 1000;
+  doc["data"]["gatewayUptime"] = (millis() - gatewayStartTime) / 1000;
   
   String jsonString;
   serializeJson(doc, jsonString);
@@ -204,145 +266,55 @@ void handleGetLatestData() {
   server.send(200, "application/json", jsonString);
 }
 
-void handleGetApiData() {
+void handleGetHistory() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   
-  if (!dataReceived) {
-    server.send(200, "application/json", "{\"temperature\":0,\"humidity\":0,\"relayStatus\":false,\"online\":false}");
+  if (historyCount == 0) {
+    server.send(200, "application/json", "{\"status\":\"success\",\"data\":[]}");
     return;
   }
   
-  bool isOnline = (millis() - lastSensorData.receivedAt) < 30000; // Consider online if data < 30 seconds old
+  String json = "{\"status\":\"success\",\"data\":[";
   
-  String json = "{";
-  json += "\"temperature\":" + String(lastSensorData.temperature) + ",";
-  json += "\"humidity\":" + String(lastSensorData.humidity) + ",";
-  json += "\"relayStatus\":" + String(lastSensorData.relayStatus ? "true" : "false") + ",";
-  json += "\"wifiSignal\":" + String(lastSensorData.wifiSignal) + ",";
-  json += "\"online\":" + String(isOnline ? "true" : "false") + ",";
-  json += "\"lastUpdate\":" + String((millis() - lastSensorData.receivedAt) / 1000);
-  json += "}";
+  // Send last 20 readings for chart
+  int itemsToSend = min(20, historyCount);
+  int startIndex = (historyIndex - itemsToSend + MAX_HISTORY) % MAX_HISTORY;
+  
+  for (int i = 0; i < itemsToSend; i++) {
+    int idx = (startIndex + i) % MAX_HISTORY;
+    
+    if (i > 0) json += ",";
+    json += "{";
+    json += "\"temperature\":" + String(dataHistory[idx].temperature) + ",";
+    json += "\"humidity\":" + String(dataHistory[idx].humidity) + ",";
+    json += "\"relayStatus\":" + String(dataHistory[idx].relayStatus ? "true" : "false") + ",";
+    json += "\"timestamp\":" + String(dataHistory[idx].timestamp);
+    json += "}";
+  }
+  
+  json += "]}";
   
   server.send(200, "application/json", json);
 }
 
-void handleDashboard() {
-  String html = R"(
-<!DOCTYPE html>
-<html>
-<head>
-    <title>EcoFarm IoT Dashboard</title>
-    <meta charset='utf-8'>
-    <meta name='viewport' content='width=device-width, initial-scale=1'>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f0f2f5; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        .header { text-align: center; margin-bottom: 30px; }
-        .header h1 { color: #2c3e50; margin: 0; }
-        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .status-card { background: white; border-radius: 10px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        .status-card h3 { margin: 0 0 10px 0; color: #34495e; }
-        .status-value { font-size: 2em; font-weight: bold; margin: 10px 0; }
-        .temperature { color: #e74c3c; }
-        .humidity { color: #3498db; }
-        .relay-on { color: #27ae60; }
-        .relay-off { color: #95a5a6; }
-        .online { color: #27ae60; }
-        .offline { color: #e74c3c; }
-        .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
-        .info-item { background: white; border-radius: 8px; padding: 15px; box-shadow: 0 1px 5px rgba(0,0,0,0.1); }
-        .refresh-btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; }
-        .refresh-btn:hover { background: #2980b9; }
-        .last-update { text-align: center; margin-top: 20px; color: #7f8c8d; }
-    </style>
-</head>
-<body>
-    <div class='container'>
-        <div class='header'>
-            <h1>🌱 EcoFarm IoT Dashboard</h1>
-            <button class='refresh-btn' onclick='loadData()'>🔄 Refresh Data</button>
-        </div>
-        
-        <div class='status-grid'>
-            <div class='status-card'>
-                <h3>🌡️ Temperature</h3>
-                <div class='status-value temperature' id='temperature'>--°C</div>
-            </div>
-            <div class='status-card'>
-                <h3>💧 Humidity</h3>
-                <div class='status-value humidity' id='humidity'>--%</div>
-            </div>
-            <div class='status-card'>
-                <h3>🔌 Exhaust Fan</h3>
-                <div class='status-value' id='relay'>--</div>
-            </div>
-            <div class='status-card'>
-                <h3>📡 System Status</h3>
-                <div class='status-value' id='status'>--</div>
-            </div>
-        </div>
-        
-        <div class='info-grid'>
-            <div class='info-item'>
-                <h4>📶 WiFi Signal</h4>
-                <div id='wifi-signal'>-- dBm</div>
-            </div>
-            <div class='info-item'>
-                <h4>⏰ Last Update</h4>
-                <div id='last-update'>--</div>
-            </div>
-            <div class='info-item'>
-                <h4>🆔 Node ID</h4>
-                <div id='node-id'>--</div>
-            </div>
-            <div class='info-item'>
-                <h4>💾 Free Memory</h4>
-                <div id='free-heap'>-- KB</div>
-            </div>
-        </div>
-        
-        <div class='last-update'>
-            <small>Dashboard auto-refreshes every 5 seconds</small>
-        </div>
-    </div>
-
-    <script>
-        function loadData() {
-            fetch('/api/data')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('temperature').textContent = data.temperature.toFixed(1) + '°C';
-                    document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
-                    
-                    const relayElement = document.getElementById('relay');
-                    relayElement.textContent = data.relayStatus ? 'ON' : 'OFF';
-                    relayElement.className = 'status-value ' + (data.relayStatus ? 'relay-on' : 'relay-off');
-                    
-                    const statusElement = document.getElementById('status');
-                    statusElement.textContent = data.online ? 'ONLINE' : 'OFFLINE';
-                    statusElement.className = 'status-value ' + (data.online ? 'online' : 'offline');
-                    
-                    document.getElementById('wifi-signal').textContent = data.wifiSignal + ' dBm';
-                    document.getElementById('last-update').textContent = data.lastUpdate + 's ago';
-                })
-                .catch(error => {
-                    console.error('Error loading data:', error);
-                    document.getElementById('status').textContent = 'ERROR';
-                    document.getElementById('status').className = 'status-value offline';
-                });
-        }
-
-        // Load data on page load
-        loadData();
-        
-        // Auto refresh every 5 seconds
-        setInterval(loadData, 5000);
-    </script>
-</body>
-</html>
-  )";
+void handleGetSystemStatus() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
   
-  server.send(200, "text/html", html);
+  bool isOnline = dataReceived && (millis() - lastSensorData.receivedAt) < 30000;
+  unsigned long uptimeSeconds = (millis() - gatewayStartTime) / 1000;
+  
+  String json = "{";
+  json += "\"gatewayStatus\":\"online\",";
+  json += "\"sensorOnline\":" + String(isOnline ? "true" : "false") + ",";
+  json += "\"gatewayUptime\":" + String(uptimeSeconds) + ",";
+  json += "\"gatewayIP\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"gatewayWiFi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"freeHeap\":" + String(ESP.getFreeHeap()) + ",";
+  json += "\"totalReadings\":" + String(historyCount) + ",";
+  json += "\"lastDataAge\":" + String(dataReceived ? (millis() - lastSensorData.receivedAt) / 1000 : 0);
+  json += "}";
+  
+  server.send(200, "application/json", json);
 }
 
 void sendDataToWebServer() {
@@ -353,7 +325,7 @@ void sendDataToWebServer() {
   http.addHeader("Content-Type", "application/json");
   
   // Create JSON payload
-  StaticJsonDocument<600> doc;
+  StaticJsonDocument<400> doc;
   doc["nodeId"] = lastSensorData.nodeId;
   doc["deviceType"] = lastSensorData.deviceType;
   doc["temperature"] = lastSensorData.temperature;
@@ -363,23 +335,906 @@ void sendDataToWebServer() {
   doc["wifiSignal"] = lastSensorData.wifiSignal;
   doc["freeHeap"] = lastSensorData.freeHeap;
   doc["chipId"] = lastSensorData.chipId;
-  doc["gatewayTimestamp"] = millis();
+  doc["gatewayIP"] = WiFi.localIP().toString();
   
   String jsonString;
   serializeJson(doc, jsonString);
-  
-  Serial.println("🌐 Sending data to web server...");
   
   int httpResponseCode = http.POST(jsonString);
   
   if (httpResponseCode > 0) {
     String response = http.getString();
-    Serial.println("✅ Data sent to web server! Response Code: " + String(httpResponseCode));
-    Serial.println("Response: " + response);
+    Serial.println("✅ Data sent to web server successfully");
+    Serial.println("📤 Response: " + response);
   } else {
     Serial.println("❌ Error sending data to web server: " + String(httpResponseCode));
-    Serial.println("Check web server URL: " + String(web_server_url));
   }
   
   http.end();
+}
+
+void handleDashboard() {
+  // Get the current gateway IP for the dashboard
+  String gatewayIP = WiFi.localIP().toString() + ":8080";
+  
+  String html = R"(<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🌱 EcoFarm IoT Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            color: white;
+        }
+
+        .header h1 {
+            font-size: 3em;
+            margin-bottom: 10px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 25px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.2);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 40px rgba(0,0,0,0.15);
+        }
+
+        .card-icon {
+            font-size: 3em;
+            margin-bottom: 15px;
+            display: block;
+        }
+
+        .card-title {
+            font-size: 1.3em;
+            margin-bottom: 15px;
+            color: #555;
+            font-weight: 600;
+        }
+
+        .card-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .temperature { color: #e74c3c; }
+        .humidity { color: #3498db; }
+        .relay-on { color: #27ae60; }
+        .relay-off { color: #95a5a6; }
+        .online { color: #27ae60; }
+        .offline { color: #e74c3c; }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+
+        .status-online { background: #27ae60; }
+        .status-offline { background: #e74c3c; }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .info-card {
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .info-card h4 {
+            color: #666;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+
+        .info-card .value {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #333;
+        }
+
+        .controls {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            text-align: center;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+
+        .btn {
+            background: linear-gradient(45deg, #3498db, #2980b9);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin: 0 10px;
+            box-shadow: 0 4px 15px rgba(52, 152, 219, 0.3);
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(52, 152, 219, 0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .chart-container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+
+        .chart {
+            width: 100%;
+            height: 300px;
+            position: relative;
+            border: 2px solid #ecf0f1;
+            border-radius: 10px;
+            background: #f8f9fa;
+        }
+
+        .chart-content {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            color: #666;
+        }
+
+        .chart-canvas {
+            width: 100%;
+            height: 100%;
+        }
+
+        .footer {
+            text-align: center;
+            color: rgba(255,255,255,0.8);
+            margin-top: 30px;
+            font-size: 0.9em;
+        }
+
+        .connection-status {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: rgba(255,255,255,0.9);
+            padding: 10px 20px;
+            border-radius: 25px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            z-index: 1000;
+        }
+
+        .alert {
+            background: #f39c12;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            text-align: center;
+            display: none;
+        }
+
+        .alert.show {
+            display: block;
+            animation: slideDown 0.3s ease;
+        }
+
+        .alert.error {
+            background: #e74c3c;
+        }
+
+        .alert.success {
+            background: #27ae60;
+        }
+
+        @keyframes slideDown {
+            from { transform: translateY(-20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .loading {
+            opacity: 0.6;
+            pointer-events: none;
+        }
+
+        .data-history {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            margin-bottom: 20px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+        }
+
+        .history-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #eee;
+        }
+
+        .history-item:last-child {
+            border-bottom: none;
+        }
+
+        @media (max-width: 768px) {
+            .header h1 { font-size: 2em; }
+            .card-value { font-size: 2em; }
+            .dashboard-grid { grid-template-columns: 1fr; }
+            .info-grid { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+            .btn { margin: 5px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="connection-status">
+        <span class="status-indicator" id="connection-indicator"></span>
+        <span id="connection-text">Connecting...</span>
+    </div>
+
+    <div class="container">
+        <div class="header">
+            <h1>🌱 EcoFarm IoT Dashboard</h1>
+            <p>Real-time Environmental Monitoring System</p>
+        </div>
+
+        <div class="alert" id="alert">
+            <strong id="alert-icon">⚠️</strong> <span id="alert-message"></span>
+        </div>
+
+        <div class="dashboard-grid">
+            <div class="card">
+                <span class="card-icon">🌡️</span>
+                <div class="card-title">Temperature</div>
+                <div class="card-value temperature" id="temperature">--°C</div>
+                <div>Target: 30-32°C</div>
+            </div>
+
+            <div class="card">
+                <span class="card-icon">💧</span>
+                <div class="card-title">Humidity</div>
+                <div class="card-value humidity" id="humidity">--%</div>
+                <div>Optimal: 60-70%</div>
+            </div>
+
+            <div class="card">
+                <span class="card-icon">🌀</span>
+                <div class="card-title">Exhaust Fan</div>
+                <div class="card-value" id="relay">--</div>
+                <div id="relay-status">Automatic Control</div>
+            </div>
+
+            <div class="card">
+                <span class="card-icon">📡</span>
+                <div class="card-title">System Status</div>
+                <div class="card-value" id="status">
+                    <span class="status-indicator" id="status-indicator"></span>
+                    <span id="status-text">--</span>
+                </div>
+                <div id="last-seen">Last update: --</div>
+            </div>
+        </div>
+
+        <div class="info-grid">
+            <div class="info-card">
+                <h4>📶 WiFi Signal</h4>
+                <div class="value" id="wifi-signal">-- dBm</div>
+            </div>
+            <div class="info-card">
+                <h4>🆔 Node ID</h4>
+                <div class="value" id="node-id">ESP32_01</div>
+            </div>
+            <div class="info-card">
+                <h4>💾 Free Memory</h4>
+                <div class="value" id="free-heap">-- KB</div>
+            </div>
+            <div class="info-card">
+                <h4>⏱️ Uptime</h4>
+                <div class="value" id="uptime">--</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <h3 style="margin-bottom: 20px; color: #555;">Dashboard Controls</h3>
+            <button class="btn" onclick="refreshData()">🔄 Refresh Now</button>
+            <button class="btn" onclick="toggleAutoRefresh()">⏯️ Auto Refresh: <span id="auto-status">ON</span></button>
+            <button class="btn" onclick="exportData()">📊 Export Data</button>
+            <button class="btn" onclick="clearHistory()">🗑️ Clear History</button>
+        </div>
+
+        <div class="chart-container">
+            <h3 style="margin-bottom: 20px; color: #555;">📈 Temperature & Humidity Trends (Last 20 readings)</h3>
+            <div class="chart">
+                <canvas id="chart-canvas" class="chart-canvas"></canvas>
+                <div class="chart-content" id="chart-placeholder">
+                    <div>📊 Loading chart data...<br>Real-time readings will appear here</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="data-history">
+            <h3 style="margin-bottom: 20px; color: #555;">📋 Recent Data History</h3>
+            <div id="history-list">
+                <div style="text-align: center; color: #666;">Loading data history...</div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>© 2024 EcoFarm IoT System | Last Updated: <span id="last-update">--</span></p>
+            <p>ESP32 Gateway: <span id="gateway-ip">)" + gatewayIP + R"(</span> | Auto-refresh: <span id="refresh-interval">5s</span></p>
+        </div>
+    </div>
+
+    <script>
+        // Configuration - Use current gateway IP
+        const ESP32_GATEWAY_IP = ')" + gatewayIP + R"(';
+        const API_ENDPOINT = `http://${ESP32_GATEWAY_IP}/api/data`;
+        const HISTORY_ENDPOINT = `http://${ESP32_GATEWAY_IP}/api/history`;
+        const STATUS_ENDPOINT = `http://${ESP32_GATEWAY_IP}/api/status`;
+        
+        let autoRefresh = true;
+        let refreshInterval = 5000; // 5 seconds
+        let refreshTimer;
+        let lastDataTime = 0;
+
+        // Data history for charts and display
+        let dataHistory = {
+            temperature: [],
+            humidity: [],
+            timestamps: [],
+            readings: []
+        };
+
+        let chart = null;
+        let maxHistoryItems = 20;
+
+        function updateConnectionStatus(connected) {
+            const indicator = document.getElementById('connection-indicator');
+            const text = document.getElementById('connection-text');
+            
+            if (connected) {
+                indicator.className = 'status-indicator status-online';
+                text.textContent = 'Connected';
+            } else {
+                indicator.className = 'status-indicator status-offline';
+                text.textContent = 'Disconnected';
+            }
+        }
+
+        function showAlert(message, type = 'warning') {
+            const alert = document.getElementById('alert');
+            const alertMessage = document.getElementById('alert-message');
+            const alertIcon = document.getElementById('alert-icon');
+            
+            // Set icon based on type
+            switch(type) {
+                case 'success':
+                    alertIcon.textContent = '✅';
+                    alert.className = 'alert success show';
+                    break;
+                case 'error':
+                    alertIcon.textContent = '❌';
+                    alert.className = 'alert error show';
+                    break;
+                default:
+                    alertIcon.textContent = '⚠️';
+                    alert.className = 'alert show';
+            }
+            
+            alertMessage.textContent = message;
+            
+            setTimeout(() => {
+                alert.classList.remove('show');
+            }, 5000);
+        }
+
+        function addToHistory(data) {
+            const now = new Date();
+            const reading = {
+                timestamp: now,
+                temperature: data.temperature,
+                humidity: data.humidity,
+                relayStatus: data.relayStatus,
+                online: data.online
+            };
+
+            dataHistory.readings.unshift(reading);
+            dataHistory.temperature.unshift(data.temperature);
+            dataHistory.humidity.unshift(data.humidity);
+            dataHistory.timestamps.unshift(now.toLocaleTimeString());
+
+            // Keep only last N items
+            if (dataHistory.readings.length > maxHistoryItems) {
+                dataHistory.readings = dataHistory.readings.slice(0, maxHistoryItems);
+                dataHistory.temperature = dataHistory.temperature.slice(0, maxHistoryItems);
+                dataHistory.humidity = dataHistory.humidity.slice(0, maxHistoryItems);
+                dataHistory.timestamps = dataHistory.timestamps.slice(0, maxHistoryItems);
+            }
+
+            updateHistoryDisplay();
+            updateChart();
+        }
+
+        function updateHistoryDisplay() {
+            const historyList = document.getElementById('history-list');
+            
+            if (dataHistory.readings.length === 0) {
+                historyList.innerHTML = '<div style="text-align: center; color: #666;">No data available</div>';
+                return;
+            }
+
+            let html = '';
+            dataHistory.readings.slice(0, 10).forEach(reading => {
+                const timeStr = reading.timestamp.toLocaleTimeString();
+                const relayIcon = reading.relayStatus ? '🟢 ON' : '🔴 OFF';
+                const statusIcon = reading.online ? '🟢' : '🔴';
+                
+                html += `
+                    <div class="history-item">
+                        <div>
+                            ${statusIcon} ${timeStr}
+                        </div>
+                        <div>
+                            🌡️ ${reading.temperature.toFixed(1)}°C | 
+                            💧 ${reading.humidity.toFixed(1)}% | 
+                            🌀 ${relayIcon}
+                        </div>
+                    </div>
+                `;
+            });
+            
+            historyList.innerHTML = html;
+        }
+
+        function updateChart() {
+            const canvas = document.getElementById('chart-canvas');
+            const placeholder = document.getElementById('chart-placeholder');
+            
+            if (dataHistory.temperature.length === 0) {
+                placeholder.style.display = 'block';
+                canvas.style.display = 'none';
+                return;
+            }
+
+            placeholder.style.display = 'none';
+            canvas.style.display = 'block';
+
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width = canvas.offsetWidth;
+            const height = canvas.height = canvas.offsetHeight;
+
+            // Clear canvas
+            ctx.clearRect(0, 0, width, height);
+
+            if (dataHistory.temperature.length < 2) return;
+
+            // Chart margins
+            const margin = { top: 20, right: 60, bottom: 40, left: 60 };
+            const chartWidth = width - margin.left - margin.right;
+            const chartHeight = height - margin.top - margin.bottom;
+
+            // Data ranges
+            const tempData = dataHistory.temperature.slice().reverse();
+            const humData = dataHistory.humidity.slice().reverse();
+            const labels = dataHistory.timestamps.slice().reverse();
+
+            const tempMin = Math.min(...tempData) - 2;
+            const tempMax = Math.max(...tempData) + 2;
+            const humMin = Math.min(...humData) - 5;
+            const humMax = Math.max(...humData) + 5;
+
+            // Draw background
+            ctx.fillStyle = '#f8f9fa';
+            ctx.fillRect(margin.left, margin.top, chartWidth, chartHeight);
+
+            // Draw grid lines
+            ctx.strokeStyle = '#e0e0e0';
+            ctx.lineWidth = 1;
+            
+            // Horizontal grid lines
+            for (let i = 0; i <= 5; i++) {
+                const y = margin.top + (chartHeight / 5) * i;
+                ctx.beginPath();
+                ctx.moveTo(margin.left, y);
+                ctx.lineTo(margin.left + chartWidth, y);
+                ctx.stroke();
+            }
+
+            // Vertical grid lines
+            const dataPoints = tempData.length;
+            for (let i = 0; i < dataPoints; i++) {
+                const x = margin.left + (chartWidth / (dataPoints - 1)) * i;
+                ctx.beginPath();
+                ctx.moveTo(x, margin.top);
+                ctx.lineTo(x, margin.top + chartHeight);
+                ctx.stroke();
+            }
+
+            // Draw temperature line
+            ctx.strokeStyle = '#e74c3c';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            
+            for (let i = 0; i < tempData.length; i++) {
+                const x = margin.left + (chartWidth / (tempData.length - 1)) * i;
+                const y = margin.top + chartHeight - ((tempData[i] - tempMin) / (tempMax - tempMin)) * chartHeight;
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.stroke();
+
+            // Draw humidity line
+            ctx.strokeStyle = '#3498db';
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            
+            for (let i = 0; i < humData.length; i++) {
+                const x = margin.left + (chartWidth / (humData.length - 1)) * i;
+                const y = margin.top + chartHeight - ((humData[i] - humMin) / (humMax - humMin)) * chartHeight;
+                
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.stroke();
+
+            // Draw data points
+            for (let i = 0; i < tempData.length; i++) {
+                const x = margin.left + (chartWidth / (tempData.length - 1)) * i;
+                
+                // Temperature points
+                const tempY = margin.top + chartHeight - ((tempData[i] - tempMin) / (tempMax - tempMin)) * chartHeight;
+                ctx.fillStyle = '#e74c3c';
+                ctx.beginPath();
+                ctx.arc(x, tempY, 4, 0, 2 * Math.PI);
+                ctx.fill();
+
+                // Humidity points
+                const humY = margin.top + chartHeight - ((humData[i] - humMin) / (humMax - humMin)) * chartHeight;
+                ctx.fillStyle = '#3498db';
+                ctx.beginPath();
+                ctx.arc(x, humY, 4, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+
+            // Draw legend
+            ctx.font = '14px Arial';
+            ctx.fillStyle = '#e74c3c';
+            ctx.fillText('🌡️ Temperature', width - 150, 30);
+            ctx.fillStyle = '#3498db';
+            ctx.fillText('💧 Humidity', width - 150, 50);
+
+            // Draw Y-axis labels
+            ctx.fillStyle = '#666';
+            ctx.font = '12px Arial';
+            ctx.textAlign = 'right';
+            
+            // Temperature labels (left side)
+            for (let i = 0; i <= 5; i++) {
+                const value = tempMin + ((tempMax - tempMin) / 5) * (5 - i);
+                const y = margin.top + (chartHeight / 5) * i;
+                ctx.fillText(value.toFixed(1) + '°C', margin.left - 10, y + 4);
+            }
+
+            // Humidity labels (right side)
+            ctx.textAlign = 'left';
+            for (let i = 0; i <= 5; i++) {
+                const value = humMin + ((humMax - humMin) / 5) * (5 - i);
+                const y = margin.top + (chartHeight / 5) * i;
+                ctx.fillText(value.toFixed(1) + '%', margin.left + chartWidth + 10, y + 4);
+            }
+        }
+
+        function formatUptime(seconds) {
+            const days = Math.floor(seconds / 86400);
+            const hours = Math.floor((seconds % 86400) / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = seconds % 60;
+
+            if (days > 0) {
+                return `${days}d ${hours}h ${minutes}m`;
+            } else if (hours > 0) {
+                return `${hours}h ${minutes}m ${secs}s`;
+            } else if (minutes > 0) {
+                return `${minutes}m ${secs}s`;
+            } else {
+                return `${secs}s`;
+            }
+        }
+
+        function updateDisplay(data) {
+            // Update main values
+            document.getElementById('temperature').textContent = data.temperature.toFixed(1) + '°C';
+            document.getElementById('humidity').textContent = data.humidity.toFixed(1) + '%';
+            
+            // Update relay status
+            const relayElement = document.getElementById('relay');
+            const relayStatusElement = document.getElementById('relay-status');
+            
+            if (data.relayStatus) {
+                relayElement.textContent = 'ON';
+                relayElement.className = 'card-value relay-on';
+                relayStatusElement.textContent = 'Fan Running - Cooling';
+            } else {
+                relayElement.textContent = 'OFF';
+                relayElement.className = 'card-value relay-off';
+                relayStatusElement.textContent = 'Fan Stopped - Standby';
+            }
+
+            // Update system status
+            const statusElement = document.getElementById('status-text');
+            const statusIndicator = document.getElementById('status-indicator');
+            const lastSeenElement = document.getElementById('last-seen');
+
+            if (data.online) {
+                statusElement.textContent = 'Online';
+                statusElement.className = 'online';
+                statusIndicator.className = 'status-indicator status-online';
+                lastSeenElement.textContent = `Last update: ${data.lastUpdate}s ago`;
+            } else {
+                statusElement.textContent = 'Offline';
+                statusElement.className = 'offline';
+                statusIndicator.className = 'status-indicator status-offline';
+                lastSeenElement.textContent = `Last seen: ${data.lastUpdate}s ago`;
+            }
+
+            // Update info cards
+            document.getElementById('wifi-signal').textContent = data.wifiSignal + ' dBm';
+            document.getElementById('free-heap').textContent = Math.round(data.freeHeap / 1024) + ' KB';
+
+            // Update last update time
+            document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+
+            // Add to history and update displays
+            addToHistory(data);
+
+            // Connection status
+            updateConnectionStatus(true);
+
+            // Show alerts based on sensor values
+            if (data.temperature > 35) {
+                showAlert('⚠️ High temperature detected! Fan should be running.', 'warning');
+            } else if (data.temperature < 25) {
+                showAlert('❄️ Low temperature detected. Check heating system.', 'warning');
+            }
+
+            if (data.humidity > 80) {
+                showAlert('💧 High humidity detected! Ventilation recommended.', 'warning');
+            } else if (data.humidity < 40) {
+                showAlert('🏜️ Low humidity detected. Consider adding moisture.', 'warning');
+            }
+
+            if (!data.online) {
+                showAlert('📡 Sensor node is offline! Check connection.', 'error');
+            }
+        }
+
+        function fetchData() {
+            fetch(API_ENDPOINT)
+                .then(response => response.json())
+                .then(data => {
+                    updateDisplay(data);
+                })
+                .catch(error => {
+                    console.error('Error fetching data:', error);
+                    updateConnectionStatus(false);
+                    showAlert('❌ Failed to fetch sensor data. Check connection.', 'error');
+                });
+        }
+
+        function fetchSystemStatus() {
+            fetch(STATUS_ENDPOINT)
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('uptime').textContent = formatUptime(data.gatewayUptime);
+                })
+                .catch(error => {
+                    console.error('Error fetching system status:', error);
+                });
+        }
+
+        function refreshData() {
+            const btn = event.target;
+            btn.classList.add('loading');
+            btn.textContent = '🔄 Refreshing...';
+            
+            fetchData();
+            fetchSystemStatus();
+            
+            setTimeout(() => {
+                btn.classList.remove('loading');
+                btn.textContent = '🔄 Refresh Now';
+                showAlert('✅ Data refreshed successfully!', 'success');
+            }, 1000);
+        }
+
+        function toggleAutoRefresh() {
+            autoRefresh = !autoRefresh;
+            const statusElement = document.getElementById('auto-status');
+            
+            if (autoRefresh) {
+                statusElement.textContent = 'ON';
+                startAutoRefresh();
+                showAlert('✅ Auto-refresh enabled', 'success');
+            } else {
+                statusElement.textContent = 'OFF';
+                clearInterval(refreshTimer);
+                showAlert('⏸️ Auto-refresh disabled', 'warning');
+            }
+        }
+
+        function exportData() {
+            if (dataHistory.readings.length === 0) {
+                showAlert('❌ No data available to export', 'error');
+                return;
+            }
+
+            let csvContent = 'Timestamp,Temperature,Humidity,Fan Status,Online Status\n';
+            
+            dataHistory.readings.forEach(reading => {
+                csvContent += `${reading.timestamp.toISOString()},`;
+                csvContent += `${reading.temperature},`;
+                csvContent += `${reading.humidity},`;
+                csvContent += `${reading.relayStatus ? 'ON' : 'OFF'},`;
+                csvContent += `${reading.online ? 'Online' : 'Offline'}\n`;
+            });
+
+            const blob = new Blob([csvContent], { type: 'text/csv' });
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `ecofarm_data_${new Date().toISOString().split('T')[0]}.csv`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            window.URL.revokeObjectURL(url);
+
+            showAlert('📊 Data exported successfully!', 'success');
+        }
+
+        function clearHistory() {
+            if (confirm('Are you sure you want to clear all data history?')) {
+                dataHistory = {
+                    temperature: [],
+                    humidity: [],
+                    timestamps: [],
+                    readings: []
+                };
+                
+                updateHistoryDisplay();
+                updateChart();
+                showAlert('🗑️ Data history cleared', 'success');
+            }
+        }
+
+        function startAutoRefresh() {
+            if (refreshTimer) clearInterval(refreshTimer);
+            
+            refreshTimer = setInterval(() => {
+                if (autoRefresh) {
+                    fetchData();
+                    fetchSystemStatus();
+                }
+            }, refreshInterval);
+        }
+
+        // Initialize dashboard
+        function initDashboard() {
+            console.log('🚀 EcoFarm IoT Dashboard Initializing...');
+            console.log('📡 Gateway IP:', ESP32_GATEWAY_IP);
+            
+            // Set gateway IP in footer
+            document.getElementById('gateway-ip').textContent = ESP32_GATEWAY_IP;
+            
+            // Initial data fetch
+            fetchData();
+            fetchSystemStatus();
+            
+            // Start auto-refresh
+            startAutoRefresh();
+            
+            // Show initialization success
+            setTimeout(() => {
+                showAlert('🌱 EcoFarm IoT Dashboard Ready!', 'success');
+            }, 1000);
+        }
+
+        // Start dashboard when page loads
+        document.addEventListener('DOMContentLoaded', initDashboard);
+        
+        // Handle page visibility change to pause/resume auto-refresh
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                clearInterval(refreshTimer);
+            } else if (autoRefresh) {
+                startAutoRefresh();
+                fetchData(); // Immediate refresh when page becomes visible
+            }
+        });
+
+        // Handle window resize for chart
+        window.addEventListener('resize', function() {
+            setTimeout(updateChart, 100);
+        });
+
+        console.log('🌱 EcoFarm IoT Dashboard Script Loaded');
+    </script>
+</body>
+</html>)";
+
+  server.send(200, "text/html", html);
 }
