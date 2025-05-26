@@ -1,0 +1,194 @@
+/*
+ * EcoFarm IoT - ESP32 Sensor Node
+ * Fungsi: Membaca sensor DHT11, kontrol relay exhaust, kirim data ke ESP32 Gateway
+ */
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// WiFi Configuration
+const char* ssid = "RAFALEON";
+const char* password = "11112222";
+
+// ESP32 Gateway Configuration
+const char* esp32_ip = "192.168.1.100"; // IP ESP32 Gateway
+const int esp32_port = 8080;
+
+// Pin Configuration for ESP32
+#define DHT_PIN 4        // GPIO4
+#define RELAY_PIN 2      // GPIO2 (Built-in LED pin, atau ganti sesuai kebutuhan)
+#define DHT_TYPE DHT11
+
+// Initialize DHT sensor
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// Temperature thresholds
+const float TEMP_HIGH = 32.0;  // Relay ON ketika suhu >= 32°C
+const float TEMP_LOW = 30.0;   // Relay OFF ketika suhu < 30°C
+
+// Variables
+float temperature = 0.0;
+float humidity = 0.0;
+bool relayStatus = false;
+unsigned long lastSensorRead = 0;
+unsigned long lastDataSend = 0;
+const unsigned long SENSOR_INTERVAL = 2000;  // Read sensor every 2 seconds
+const unsigned long SEND_INTERVAL = 5000;    // Send data every 5 seconds
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // FIXED: Start with relay OFF (HIGH for Active Low relay)
+  
+  // Initialize DHT sensor
+  dht.begin();
+  
+  // Connect to WiFi
+  connectWiFi();
+  
+  Serial.println("ESP32 EcoFarm Sensor Node Started!");
+  Serial.println("Temperature Control:");
+  Serial.println("- Relay ON when temp >= " + String(TEMP_HIGH) + "°C");
+  Serial.println("- Relay OFF when temp < " + String(TEMP_LOW) + "°C");
+  Serial.println("Pin Configuration:");
+  Serial.println("- DHT11 Sensor: GPIO" + String(DHT_PIN));
+  Serial.println("- Relay Control: GPIO" + String(RELAY_PIN));
+  Serial.println("🔧 Relay Module Type: Active Low (LOW=ON, HIGH=OFF)");
+  Serial.println("💡 Initial State: Relay OFF, LED should be OFF");
+}
+
+void loop() {
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+  
+  // Read sensor data
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
+    readSensorData();
+    controlRelay();
+    lastSensorRead = millis();
+  }
+  
+  // Send data to ESP32 gateway
+  if (millis() - lastDataSend >= SEND_INTERVAL) {
+    sendDataToGateway();
+    lastDataSend = millis();
+  }
+  
+  delay(100);
+}
+
+void connectWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+  Serial.print("WiFi Signal Strength: ");
+  Serial.print(WiFi.RSSI());
+  Serial.println(" dBm");
+}
+
+void readSensorData() {
+  // Read temperature and humidity
+  float newTemp = dht.readTemperature();
+  float newHum = dht.readHumidity();
+  
+  // Check if readings are valid
+  if (!isnan(newTemp) && !isnan(newHum)) {
+    temperature = newTemp;
+    humidity = newHum;
+    
+    Serial.println("=== Sensor Reading ===");
+    Serial.println("Temperature: " + String(temperature) + "°C");
+    Serial.println("Humidity: " + String(humidity) + "%");
+  } else {
+    Serial.println("Failed to read from DHT sensor!");
+    Serial.println("Check DHT11 connection on GPIO" + String(DHT_PIN));
+  }
+}
+
+void controlRelay() {
+  bool newRelayStatus = relayStatus;
+  
+  // Temperature control logic with proper hysteresis
+  if (temperature >= TEMP_HIGH && !relayStatus) {
+    // Turn ON relay when temp reaches or exceeds HIGH threshold
+    newRelayStatus = true;
+    Serial.println("🔥 Temperature HIGH (" + String(temperature) + "°C >= " + String(TEMP_HIGH) + "°C) - Turning ON exhaust");
+  } 
+  else if (temperature < TEMP_LOW && relayStatus) {
+    // Turn OFF relay when temp drops below LOW threshold
+    newRelayStatus = false;
+    Serial.println("❄️ Temperature LOW (" + String(temperature) + "°C < " + String(TEMP_LOW) + "°C) - Turning OFF exhaust");
+  }
+  
+  // Update relay if status changed
+  if (newRelayStatus != relayStatus) {
+    relayStatus = newRelayStatus;
+    digitalWrite(RELAY_PIN, relayStatus ? LOW : HIGH);
+    Serial.println("🔌 Relay Status: " + String(relayStatus ? "ON" : "OFF"));
+    Serial.println("📊 Current temp: " + String(temperature) + "°C | Relay: " + String(relayStatus ? "ON" : "OFF"));
+  } else {
+    // Show status even if no change (for debugging)
+    Serial.println("📊 Current temp: " + String(temperature) + "°C | Relay: " + String(relayStatus ? "ON" : "OFF") + " (no change)");
+  }
+}
+
+void sendDataToGateway() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    
+    // Construct URL
+    String url = "http://" + String(esp32_ip) + ":" + String(esp32_port) + "/sensor-data";
+    
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    
+    // Create JSON payload
+    StaticJsonDocument<300> doc;
+    doc["nodeId"] = "ESP32_01";
+    doc["deviceType"] = "ESP32";
+    doc["temperature"] = temperature;
+    doc["humidity"] = humidity;
+    doc["relayStatus"] = relayStatus;
+    doc["timestamp"] = millis();
+    doc["wifiSignal"] = WiFi.RSSI();
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["chipId"] = String((uint32_t)ESP.getEfuseMac(), HEX);
+    
+    String jsonString;
+    serializeJson(doc, jsonString);
+    
+    Serial.println("Sending data: " + jsonString);
+    
+    // Send POST request
+    int httpResponseCode = http.POST(jsonString);
+    
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.println("✅ Data sent successfully! Response Code: " + String(httpResponseCode));
+      Serial.println("Response: " + response);
+    } else {
+      Serial.println("❌ Error sending data: " + String(httpResponseCode));
+      Serial.println("Check ESP32 Gateway connection at " + String(esp32_ip) + ":" + String(esp32_port));
+    }
+    
+    http.end();
+  } else {
+    Serial.println("❌ WiFi not connected - cannot send data");
+    Serial.println("Attempting to reconnect...");
+  }
+}
